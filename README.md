@@ -1,4 +1,4 @@
-# Hush 0.1 — Android-friendly adaptive masking prototype
+# Hush 0.2 — Android-friendly adaptive masking prototype
 
 This is a Progressive Web App (PWA). It runs in Chrome on Android and can be added to the home screen. It is not yet a native Android APK.
 
