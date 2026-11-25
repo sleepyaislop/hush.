@@ -38,7 +38,7 @@
 <body>
 <main>
   <header>
-    <div><h1>HUSH</h1><div class="tag">ADAPTIVE SOUND MASKING · 0.1</div></div>
+    <div><h1>HUSH</h1><div class="tag">ADAPTIVE SOUND MASKING · 0.2</div></div>
     <span class="status"><i id="dot" class="dot"></i><span id="status">Not running</span></span>
   </header>
 
@@ -47,6 +47,13 @@
     <div class="value" id="peak">— Hz</div>
     <div class="muted" id="peakNote">Start monitoring to identify a dominant frequency.</div>
     <canvas id="spectrum" width="640" height="180" aria-label="Live frequency spectrum"></canvas>
+    <div class="buttons"><button id="capture" class="primary">Capture 10-second profile</button><span class="muted" id="captureStatus">No profile yet</span></div>
+  </section>
+
+  <section class="panel" id="profilePanel">
+    <div class="row"><strong>Room noise profile</strong><span class="tag" id="profileState">NOT CAPTURED</span></div>
+    <p class="muted" id="profileSummary">Capture ten seconds to build a frequency profile of the sound around your phone.</p>
+    <div class="muted" id="profileDetails">The profile contains frequency-level averages only — Hush does not save or upload a sound recording.</div>
   </section>
 
   <section class="panel">
@@ -81,7 +88,7 @@
   </section>
 
   <footer>
-    Hush 0.1 processes microphone audio locally in your browser. It does not record or upload audio. Keep this page open while running. Headphone isolation and Bluetooth latency vary by device.
+    Hush 0.2 analyses microphone audio locally in your browser. A profile capture stores only averaged frequency levels in the current page session — it does not save or upload a sound recording. Keep this page open while running. Headphone isolation and Bluetooth latency vary by device.
   </footer>
 </main>
 <script>
@@ -90,7 +97,7 @@
   const canvas = $('spectrum'), ctx = canvas.getContext('2d');
   let audioCtx, micStream, analyser, source, noiseSource, outputGain, filters = [];
   let running = false, mode = 'auto', raf = 0, lastAdjust = 0;
-  let smoothedPeak = 100, peakDb = -100;
+  let smoothedPeak = 100, peakDb = -100, capturing = false;
   const fftSize = 8192;
 
   function setStatus(text, on=false) {
@@ -258,6 +265,7 @@
   }
 
   function stop() {
+    capturing = false;
     running = false;
     cancelAnimationFrame(raf);
     if (noiseSource) { try { noiseSource.stop(); } catch(e){} noiseSource.disconnect(); noiseSource=null; }
@@ -266,6 +274,7 @@
     if (audioCtx) { audioCtx.close(); audioCtx=null; }
     analyser=null; outputGain=null; filters=[];
     $('stop').disabled = true; $('start').disabled = false;
+    $('capture').disabled = false;
     setStatus('Not running');
     $('peak').textContent='— Hz';
     $('peakNote').textContent='Start monitoring to identify a dominant frequency.';
@@ -277,6 +286,74 @@
     if (!running) { $('start').disabled=false; $('stop').disabled=true; }
   };
   $('stop').onclick = stop;
+
+  // Capture a ten-second frequency snapshot. Only averaged spectrum bins are retained;
+  // the microphone waveform itself is never recorded or stored.
+  $('capture').onclick = async () => {
+    if (capturing) return;
+    $('capture').disabled = true;
+    if (!running) {
+      $('start').disabled = true;
+      await start();
+      if (!running) { $('start').disabled = false; $('capture').disabled = false; return; }
+      $('start').disabled = true;
+      $('stop').disabled = false;
+    }
+    capturing = true;
+    const samples = [];
+    const startedAt = performance.now();
+    $('profileState').textContent = 'CAPTURING';
+    $('profileSummary').textContent = 'Listening for ten seconds… keep the phone near the fridge.';
+    $('profileDetails').textContent = 'No audio recording is being made.';
+    while (capturing && running && performance.now() - startedAt < 10000) {
+      const elapsed = performance.now() - startedAt;
+      const remaining = Math.max(0, Math.ceil((10000 - elapsed) / 1000));
+      $('captureStatus').textContent = 'Capturing · ' + remaining + 's';
+      const frame = new Float32Array(analyser.frequencyBinCount);
+      analyser.getFloatFrequencyData(frame);
+      samples.push(frame);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (capturing && running && samples.length) {
+      const avg = new Float32Array(samples[0].length);
+      for (let i = 0; i < avg.length; i++) {
+        let power = 0, count = 0;
+        for (const frame of samples) {
+          if (Number.isFinite(frame[i]) && frame[i] > -120) {
+            power += Math.pow(10, frame[i] / 10); count++;
+          }
+        }
+        avg[i] = count ? 10 * Math.log10(power / count) : -120;
+      }
+      const profilePeak = detectPeak(avg);
+      const binHz = audioCtx.sampleRate / fftSize;
+      const band = (lo, hi) => {
+        let sum = 0, count = 0;
+        for (let i = Math.max(1, Math.floor(lo/binHz)); i < Math.min(avg.length, Math.ceil(hi/binHz)); i++) {
+          if (Number.isFinite(avg[i]) && avg[i] > -120) { sum += Math.pow(10, avg[i]/10); count++; }
+        }
+        return count ? Math.round(10*Math.log10(sum/count)) : -120;
+      };
+      const low = band(40, 200), mid = band(200, 600), high = band(600, 1000);
+      $('profileState').textContent = 'PROFILE READY';
+      $('profileSummary').textContent = profilePeak.db > -85
+        ? 'Dominant average peak: ' + Math.round(profilePeak.hz) + ' Hz · ' + Math.round(profilePeak.db) + ' dBFS'
+        : 'No strong, stable tonal peak found in the captured sound.';
+      $('profileDetails').textContent = 'Average band levels (relative): low 40–200 Hz ' + low + ' dBFS · mid 200–600 Hz ' + mid + ' dBFS · high 600–1,000 Hz ' + high + ' dBFS. ' + samples.length + ' spectrum snapshots analysed.';
+      if (profilePeak.db > -85) {
+        smoothedPeak = profilePeak.hz;
+        $('peak').textContent = Math.round(profilePeak.hz) + ' Hz';
+        $('peakNote').textContent = 'Profile average · strongest peak over ten seconds';
+        if (mode === 'auto') updateFilters(profilePeak.hz);
+      }
+      $('captureStatus').textContent = 'Profile captured';
+    } else {
+      $('captureStatus').textContent = 'Capture cancelled';
+      $('profileState').textContent = 'NOT CAPTURED';
+    }
+    capturing = false;
+    $('capture').disabled = false;
+  };
   $('noise').onchange = () => {
     $('explain').textContent = $('noise').value === 'brown'
       ? 'Brown-style output is pink noise low-passed at 450 Hz in this prototype.'
