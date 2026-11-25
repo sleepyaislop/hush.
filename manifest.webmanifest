@@ -1,0 +1,9 @@
+{
+  "name": "Hush Adaptive Sound Masking",
+  "short_name": "Hush",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#101a27",
+  "theme_color": "#101a27",
+  "description": "Local adaptive sound masking prototype"
+}

@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101a27">
+  <meta name="description" content="Hush — local adaptive sound masking prototype">
+  <link rel="manifest" href="manifest.webmanifest">
+  <title>Hush — Adaptive Sound Masking</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101a27; --panel:#1d2b3a; --muted:#a8bacb; --mint:#65c8b4; --line:#304356; }
+    * { box-sizing:border-box }
+    body { margin:0; background:var(--bg); color:#f4f7fa; font:16px system-ui,-apple-system,Segoe UI,sans-serif; }
+    main { max-width:720px; margin:auto; padding:22px 16px 40px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
+    h1 { margin:0; letter-spacing:.16em; font-size:28px; }
+    .tag { color:var(--mint); font-size:11px; letter-spacing:.12em; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .muted { color:var(--muted); font-size:13px; }
+    .value { font-size:28px; font-weight:700; font-variant-numeric:tabular-nums; }
+    canvas { width:100%; height:150px; display:block; background:#142231; border-radius:10px; margin-top:12px; }
+    button, select { border:1px solid var(--line); border-radius:11px; padding:12px 14px; color:#fff; background:#26394b; font:inherit; }
+    button.primary { background:var(--mint); color:#10232a; border-color:var(--mint); font-weight:700; }
+    button:disabled { opacity:.45; }
+    .buttons { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+    label { display:block; margin:15px 0 7px; font-size:14px; }
+    input[type=range] { width:100%; accent-color:var(--mint); }
+    .status { display:inline-flex; align-items:center; gap:7px; color:var(--muted); font-size:13px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#8998a6; display:inline-block; }
+    .dot.on { background:var(--mint); }
+    .notice { border-left:3px solid var(--mint); padding:9px 12px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .hidden { display:none; }
+    footer { color:var(--muted); font-size:12px; line-height:1.5; padding:10px 2px; }
+    @media (min-width:600px) { main { padding-top:34px } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>HUSH</h1><div class="tag">ADAPTIVE SOUND MASKING · 0.1</div></div>
+    <span class="status"><i id="dot" class="dot"></i><span id="status">Not running</span></span>
+  </header>
+
+  <section class="panel">
+    <div class="row"><strong>Live sound analysis</strong><span class="muted" id="micState">Microphone off</span></div>
+    <div class="value" id="peak">— Hz</div>
+    <div class="muted" id="peakNote">Start monitoring to identify a dominant frequency.</div>
+    <canvas id="spectrum" width="640" height="180" aria-label="Live frequency spectrum"></canvas>
+  </section>
+
+  <section class="panel">
+    <div class="row"><strong>Masking engine</strong><span class="tag" id="modeLabel">AUTO</span></div>
+    <div class="buttons">
+      <button id="autoBtn" class="primary">Automatic</button>
+      <button id="manualBtn">Manual</button>
+    </div>
+    <label for="noise">Masking sound</label>
+    <select id="noise">
+      <option value="pink">Pink noise</option>
+      <option value="brown">Brown-style noise</option>
+    </select>
+    <label for="intensity">Output level: <span id="intensityText">10%</span></label>
+    <input id="intensity" type="range" min="0" max="25" value="10">
+    <div id="manualControls" class="hidden">
+      <label for="target">Manual target frequency: <span id="targetText">100 Hz</span></label>
+      <input id="target" type="range" min="40" max="1000" value="100" step="5">
+      <label for="width">Masking width: <span id="widthText">1.2</span></label>
+      <input id="width" type="range" min="0.5" max="4" value="1.2" step="0.1">
+    </div>
+    <div class="buttons">
+      <button id="start" class="primary">Start Hush</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <strong>What Hush is detecting</strong>
+    <p class="muted" id="explain">Automatic mode will look for prominent, persistent low-frequency peaks between 40 Hz and 1 kHz.</p>
+    <div class="notice">Keep the phone microphone near the fridge and use headphones for output. Start at a low level and increase only as needed. This prototype masks sound; it does not cancel it.</div>
+  </section>
+
+  <footer>
+    Hush 0.1 processes microphone audio locally in your browser. It does not record or upload audio. Keep this page open while running. Headphone isolation and Bluetooth latency vary by device.
+  </footer>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const canvas = $('spectrum'), ctx = canvas.getContext('2d');
+  let audioCtx, micStream, analyser, source, noiseSource, outputGain, filters = [];
+  let running = false, mode = 'auto', raf = 0, lastAdjust = 0;
+  let smoothedPeak = 100, peakDb = -100;
+  const fftSize = 8192;
+
+  function setStatus(text, on=false) {
+    $('status').textContent = text;
+    $('dot').classList.toggle('on', on);
+    $('micState').textContent = on ? 'Microphone active' : 'Microphone off';
+  }
+  function setMode(next) {
+    mode = next;
+    $('modeLabel').textContent = next.toUpperCase();
+    $('autoBtn').classList.toggle('primary', next === 'auto');
+    $('manualBtn').classList.toggle('primary', next === 'manual');
+    $('manualControls').classList.toggle('hidden', next !== 'manual');
+    $('explain').textContent = next === 'auto'
+      ? 'Automatic mode tracks prominent, persistent peaks between 40 Hz and 1 kHz and gently adjusts the masking profile.'
+      : 'Manual mode holds the target frequency and width you choose, regardless of what the microphone detects.';
+  }
+  $('autoBtn').onclick = () => setMode('auto');
+  $('manualBtn').onclick = () => setMode('manual');
+  $('intensity').oninput = () => {
+    $('intensityText').textContent = $('intensity').value + '%';
+    if (outputGain) outputGain.gain.setTargetAtTime(Number($('intensity').value)/100, audioCtx.currentTime, .15);
+  };
+  $('target').oninput = () => { $('targetText').textContent = $('target').value + ' Hz'; updateFilters(Number($('target').value)); };
+  $('width').oninput = () => { $('widthText').textContent = Number($('width').value).toFixed(1); updateFilters(mode === 'manual' ? Number($('target').value) : smoothedPeak); };
+
+  function makePinkBuffer(context) {
+    const length = context.sampleRate * 6;
+    const buffer = context.createBuffer(1, length, context.sampleRate);
+    const data = buffer.getChannelData(0);
+    let rows = new Float32Array(16), runningSum = 0, counter = 0;
+    for (let i=0; i<length; i++) {
+      counter++;
+      let n = counter;
+      for (let r=0; r<16; r++) {
+        if ((n & 1) === 0) break;
+        runningSum -= rows[r];
+        rows[r] = Math.random()*2-1;
+        runningSum += rows[r];
+        n = Math.floor(n/2);
+      }
+      data[i] = (runningSum + (Math.random()*2-1)) * 0.045;
+    }
+    return buffer;
+  }
+
+  function updateFilters(freq) {
+    if (!audioCtx || !filters.length) return;
+    const width = Number($('width').value);
+    const gains = [5, 3, 1.5];
+    filters.forEach((f, i) => {
+      const centers = [freq, Math.min(1000, freq*1.45), Math.max(40, freq/1.45)];
+      f.frequency.setTargetAtTime(centers[i], audioCtx.currentTime, .3);
+      f.Q.setTargetAtTime(1 / width, audioCtx.currentTime, .3);
+      f.gain.setTargetAtTime(gains[i] * (Number($('intensity').value)/25), audioCtx.currentTime, .3);
+    });
+  }
+
+  function drawSpectrum(data) {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = '#142231'; ctx.fillRect(0,0,w,h);
+    ctx.strokeStyle = '#304356'; ctx.lineWidth = 1;
+    for (let y=1; y<4; y++) { ctx.beginPath(); ctx.moveTo(0,h*y/4); ctx.lineTo(w,h*y/4); ctx.stroke(); }
+    ctx.beginPath(); ctx.strokeStyle = '#65c8b4'; ctx.lineWidth = 2;
+    let started = false;
+    const minHz=20, maxHz=2000;
+    for (let x=0; x<w; x++) {
+      const hz = minHz * Math.pow(maxHz/minHz, x/(w-1));
+      const bin = Math.max(0, Math.min(data.length-1, Math.round(hz*fftSize/audioCtx.sampleRate)));
+      const db = data[bin];
+      const y = h - Math.max(0, Math.min(1, (db+100)/85))*h;
+      if (!started) { ctx.moveTo(x,y); started=true; } else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#a8bacb'; ctx.font='12px system-ui';
+    ctx.fillText('20 Hz',6,h-7); ctx.fillText('2 kHz',w-48,h-7);
+  }
+
+  function detectPeak(data) {
+    const binHz = audioCtx.sampleRate/fftSize;
+    let bestBin = Math.round(40/binHz), endBin = Math.min(data.length-2, Math.round(1000/binHz));
+    let best = -120;
+    for (let i=bestBin+1; i<endBin; i++) {
+      // A local peak is less likely to be a broad noise floor.
+      if (data[i] > data[i-1] && data[i] >= data[i+1] && data[i] > best) {
+        best = data[i]; bestBin = i;
+      }
+    }
+    const hz = bestBin*binHz;
+    return { hz, db: best };
+  }
+
+  function loop() {
+    if (!running) return;
+    const data = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(data);
+    drawSpectrum(data);
+    const p = detectPeak(data);
+    peakDb = p.db;
+    if (p.db > -85 && p.hz >= 40) {
+      smoothedPeak = smoothedPeak*.82 + p.hz*.18;
+      $('peak').textContent = Math.round(smoothedPeak) + ' Hz';
+      $('peakNote').textContent = 'Strongest detected local peak · ' + Math.round(p.db) + ' dBFS (relative digital level)';
+      if (mode === 'auto' && performance.now()-lastAdjust > 350) {
+        updateFilters(smoothedPeak);
+        lastAdjust = performance.now();
+      }
+    } else {
+      $('peak').textContent = 'No clear peak';
+      $('peakNote').textContent = 'Try moving the phone closer to the fridge or wait for its compressor to run.';
+    }
+    raf = requestAnimationFrame(loop);
+  }
+
+  async function start() {
+    if (running) return;
+    try {
+      setStatus('Requesting microphone…');
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false },
+        video:false
+      });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'interactive'});
+      await audioCtx.resume();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = fftSize;
+      analyser.smoothingTimeConstant = .65;
+      source = audioCtx.createMediaStreamSource(micStream);
+      source.connect(analyser);
+
+      outputGain = audioCtx.createGain();
+      outputGain.gain.value = Number($('intensity').value)/100;
+      filters = [];
+      let chain = outputGain;
+      for (let i=0; i<3; i++) {
+        const f = audioCtx.createBiquadFilter();
+        f.type = 'peaking'; f.frequency.value = [100,145,70][i]; f.Q.value = 1;
+        f.gain.value = 0;
+        filters.push(f);
+      }
+      // Noise is generated independently of the microphone input; there is no mic-to-headphone passthrough.
+      const noise = audioCtx.createBufferSource();
+      noise.buffer = makePinkBuffer(audioCtx);
+      noise.loop = true;
+      let noiseChain = noise;
+      const lowpass = audioCtx.createBiquadFilter();
+      lowpass.type = 'lowpass'; lowpass.frequency.value = $('noise').value === 'brown' ? 450 : 18000;
+      if ($('noise').value === 'brown') noiseChain.connect(lowpass), noiseChain = lowpass;
+      filters.forEach(f => { noiseChain.connect(f); noiseChain = f; });
+      noiseChain.connect(outputGain);
+      outputGain.connect(audioCtx.destination);
+      noise.start(); noiseSource = noise;
+      running = true;
+      setStatus('Running', true);
+      loop();
+      if (mode === 'manual') updateFilters(Number($('target').value));
+      else updateFilters(smoothedPeak);
+    } catch (err) {
+      console.error(err);
+      setStatus('Could not start');
+      alert('Hush could not access the microphone or start audio. Check Chrome microphone permissions and try again. Details: ' + err.message);
+      stop();
+    }
+  }
+
+  function stop() {
+    running = false;
+    cancelAnimationFrame(raf);
+    if (noiseSource) { try { noiseSource.stop(); } catch(e){} noiseSource.disconnect(); noiseSource=null; }
+    if (micStream) { micStream.getTracks().forEach(t=>t.stop()); micStream=null; }
+    if (source) { source.disconnect(); source=null; }
+    if (audioCtx) { audioCtx.close(); audioCtx=null; }
+    analyser=null; outputGain=null; filters=[];
+    $('stop').disabled = true; $('start').disabled = false;
+    setStatus('Not running');
+    $('peak').textContent='— Hz';
+    $('peakNote').textContent='Start monitoring to identify a dominant frequency.';
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  }
+  $('start').onclick = async () => {
+    $('start').disabled = true; $('stop').disabled = false;
+    await start();
+    if (!running) { $('start').disabled=false; $('stop').disabled=true; }
+  };
+  $('stop').onclick = stop;
+  $('noise').onchange = () => {
+    $('explain').textContent = $('noise').value === 'brown'
+      ? 'Brown-style output is pink noise low-passed at 450 Hz in this prototype.'
+      : 'Pink noise provides a broader, balanced masking spectrum.';
+  };
+  window.addEventListener('pagehide', stop);
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+  }
+})();
+</script>
+</body>
+</html>
